@@ -4,6 +4,7 @@
 
 import copy
 import gc
+import os
 from bisect import bisect_right
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -488,22 +489,35 @@ def extend_kv_cache(
             kv_cache.num_committed_blocks,
             num_blocks,
         )
-    kv_cache.commit(
-        num_blocks,
-        defragment=registers_kv_cache_memory(runner.vllm_config),
-        shrink=True,
+    phase_admission = os.getenv("VLLM_EXPERIMENTAL_PHASE_ADMISSION") == "1"
+    if phase_admission:
+        kv_cache.release_physical()
+        kv_cache.num_committed_blocks = 0
+        kv_cache.commit(1)
+        kv_cache.set_torch_memory_limit(None)
+    else:
+        kv_cache.commit(
+            num_blocks,
+            defragment=registers_kv_cache_memory(runner.vllm_config),
+            shrink=True,
+        )
+    runner.kv_cache_config.num_blocks = (
+        num_blocks if phase_admission else kv_cache.num_committed_blocks
     )
-    runner.kv_cache_config.num_blocks = kv_cache.num_committed_blocks
     logger.info(
         "Extended KV cache to %d blocks (%.2f GiB).",
         kv_cache.num_committed_blocks,
         kv_cache.physical_bytes / (1 << 30),
     )
     forward_context = runner.compilation_config.static_forward_context
-    committed = kv_cache.committed_views(
-        runner.kv_cache_config,
-        runner.cache_config.get_resolved_kv_cache_layout(),
-        runner.kernel_block_sizes,
+    committed = (
+        None
+        if phase_admission
+        else kv_cache.committed_views(
+            runner.kv_cache_config,
+            runner.cache_config.get_resolved_kv_cache_layout(),
+            runner.kernel_block_sizes,
+        )
     )
     if committed is not None:
         if runner.vllm_config.attention_config.hisparse_config is not None:

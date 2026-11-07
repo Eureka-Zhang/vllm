@@ -3,6 +3,7 @@
 """KV cache planning: grouping, sizing, and memory-fit logic."""
 
 import math
+import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
@@ -1788,6 +1789,9 @@ def finalize_extensible_kv_cache(
     # No measurements: the elastic-EP scale-up path skips warmup. Elastic EP
     # leaves the extensible KV cache off, so this branch is not reached; it
     # keeps the capacity.
+    if os.getenv("VLLM_EXPERIMENTAL_PHASE_ADMISSION") == "1":
+        # Capacity is a virtual reservation; each admitted request backs its quota.
+        return scheduler_kv_cache_config.num_blocks
     block_counts = (
         times.num_kv_blocks
         for times in compilation_times

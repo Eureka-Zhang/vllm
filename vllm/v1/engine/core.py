@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import os
+import pickle
 import queue
 import signal
 import threading
@@ -1208,6 +1209,44 @@ class EngineCore:
         self.model_executor.save_sharded_state(
             path=path, pattern=pattern, max_size=max_size
         )
+
+    def phase_begin(self, request):
+        if os.getenv("VLLM_EXPERIMENTAL_PHASE_ADMISSION") != "1":
+            raise ValueError("Phase admission is disabled")
+        # Only trusted, internal frontend requests use this utility channel.
+        request = pickle.loads(request)
+        if (
+            self.scheduler.get_num_unfinished_requests()
+            or getattr(self, "_phase_reserved_id", None) is not None
+        ):
+            return {"accepted": False, "reason": "Previous request is still reclaiming"}
+        if self.vllm_config.parallel_config.world_size != 1:
+            raise ValueError("Phase admission requires one rank")
+        result = self.collective_rpc("phase_admit", args=(request,))[0]
+        if result["accepted"]:
+            self._phase_reserved_id = request.request_id
+            self._phase_reset_pool(result["budget_blocks"])
+        return result
+
+    def _phase_reset_pool(self, blocks):
+        from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue
+
+        pool = self.scheduler.kv_cache_manager.block_pool
+        if any(b.ref_cnt for b in pool.blocks if not b.is_null):
+            raise RuntimeError("Cannot resize phase quota with live block references")
+        pool.free_block_queue = FreeKVCacheBlockQueue(
+            [b for b in pool.blocks[:blocks] if not b.is_null]
+        )
+        pool.num_gpu_blocks = blocks
+
+    def phase_end(self):
+        if self.scheduler.get_num_unfinished_requests():
+            return False
+        self.collective_rpc("phase_end_request")
+        pool = self.scheduler.kv_cache_manager.block_pool
+        self._phase_reset_pool(len(pool.blocks))
+        self._phase_reserved_id = None
+        return True
 
     def collective_rpc(
         self,

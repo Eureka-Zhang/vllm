@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import os
+import pickle
 import socket
 import time
 from collections.abc import AsyncGenerator, Iterable, Mapping
@@ -534,6 +535,16 @@ class AsyncLLM(EngineClient):
 
         self.input_processor.assign_request_id(request)
 
+        if os.getenv("VLLM_EXPERIMENTAL_PHASE_ADMISSION") == "1":
+            if not isinstance(request.params, SamplingParams) or request.params.n != 1:
+                raise VLLMValidationError("Phase admission requires n=1 generation")
+            result = await self.engine_core.call_utility_async(
+                "phase_begin", pickle.dumps(request)
+            )
+            if not result["accepted"]:
+                raise VLLMValidationError(result["reason"])
+            logger.info("Phase admission: %s", result)
+
         # We start the output_handler on the first call to add_request() so
         # we can call __init__ before the event loop, which enables us
         # to handle startup failure gracefully in the OpenAI server.
@@ -782,6 +793,12 @@ class AsyncLLM(EngineClient):
             >>> gen = self.generate(engine_input, sampling_params, request_id)
 
         """
+        phase_locked = False
+        if os.getenv("VLLM_EXPERIMENTAL_PHASE_ADMISSION") == "1":
+            if not hasattr(self, "_phase_admission_lock"):
+                self._phase_admission_lock = asyncio.Lock()
+            await self._phase_admission_lock.acquire()
+            phase_locked = True
         q: RequestOutputCollector | None = None
         try:
             q = await self.add_request(
@@ -866,6 +883,19 @@ class AsyncLLM(EngineClient):
         finally:
             if q is not None:
                 q.close()
+            if phase_locked:
+
+                async def reclaim():
+                    try:
+                        for _ in range(100):
+                            if await self.engine_core.call_utility_async("phase_end"):
+                                return
+                            await asyncio.sleep(0.05)
+                        raise RuntimeError("Phase request cleanup timed out")
+                    finally:
+                        self._phase_admission_lock.release()
+
+                await asyncio.shield(reclaim())
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""

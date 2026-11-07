@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
@@ -1833,6 +1834,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            if os.getenv("VLLM_EXPERIMENTAL_PHASE_MEMORY") == "1":
+                from vllm.v1.worker.gpu.phase_memory import prepare_phase_step
+
+                prepare_phase_step(self, scheduler_output)
             self.draft_tokens_handler.begin_step(scheduler_output)
             # Update the request states.
             self.update_pp_decode_requests()

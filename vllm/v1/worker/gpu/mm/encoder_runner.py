@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import threading
 import time
 from collections.abc import Collection
@@ -148,6 +149,40 @@ class EncoderRunner:
 
     @torch.inference_mode()
     def execute_mm_encoder(
+        self, mm_kwargs: list[tuple[str, MultiModalKwargsItem]]
+    ) -> list[torch.Tensor]:
+        if os.getenv("VLLM_EXPERIMENTAL_PHASE_MEMORY") != "1":
+            return self._execute_mm_encoder(mm_kwargs)
+        visual = getattr(self.model, "visual", None)
+        if visual is None or self.cudagraph_manager is not None:
+            raise RuntimeError(
+                "Phase memory requires a visual module and eager encoder"
+            )
+        torch.cuda.synchronize(self.device)
+        before = getattr(self, "phase_before_encode", None)
+        if before is not None:
+            before()
+        visual.to(self.device)
+        try:
+            outputs = self._execute_mm_encoder(mm_kwargs)
+            torch.cuda.synchronize(self.device)
+            return outputs
+        finally:
+            torch.cuda.synchronize(self.device)
+            visual.to("cpu")
+            torch.cuda.empty_cache()
+            after = getattr(self, "phase_after_encode", None)
+            if after is not None:
+                after()
+            logger.info(
+                "Phase memory: vision offloaded; allocated=%d reserved=%d free=%d",
+                torch.cuda.memory_allocated(self.device),
+                torch.cuda.memory_reserved(self.device),
+                torch.cuda.mem_get_info(self.device)[0],
+            )
+
+    @torch.inference_mode()
+    def _execute_mm_encoder(
         self, mm_kwargs: list[tuple[str, MultiModalKwargsItem]]
     ) -> list[torch.Tensor]:
         # Stable-sort items by modality so each modality is encoded in as few

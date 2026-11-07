@@ -3,6 +3,7 @@
 
 import asyncio
 import functools
+import os
 from collections.abc import Sequence
 from http import HTTPStatus
 from typing import Any
@@ -249,6 +250,17 @@ def get_max_tokens(
         raise ValueError(
             f"Input length ({input_length}) exceeds model's maximum "
             f"context length ({max_model_len})."
+        )
+    if (
+        os.getenv("VLLM_EXPERIMENTAL_PHASE_ADMISSION") == "1"
+        and max_tokens is not None
+        and input_length + max_tokens > max_model_len
+    ):
+        from vllm.exceptions import VLLMValidationError
+
+        raise VLLMValidationError(
+            f"Input ({input_length}) + requested output ({max_tokens}) exceeds "
+            f"hard context limit ({max_model_len}); output budget is not truncated."
         )
     model_max_tokens = max_model_len - input_length
     platform_max_tokens = current_platform.get_max_output_tokens(input_length)
