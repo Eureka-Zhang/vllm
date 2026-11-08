@@ -1,0 +1,808 @@
+diff --git a/vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu b/vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu
+index 49aec30..863ad3e 100644
+--- a/vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu
++++ b/vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu
+@@ -0,0 +1,4 @@
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
+@@ -103,0 +108,43 @@ Tensor ggml_dequantize(Tensor W,  // quant weight
++// All supported dequantization kernels overwrite every output element.
++Tensor ggml_dequantize_empty(Tensor W,  // quant weight
++                       int64_t type, int64_t m, int64_t n,
++                       std::optional<ScalarType> dtype) {
++  const int32_t device_idx = W.get_device_index();
++  const DeviceGuard device_guard(device_idx);
++  const auto dtype_ = dtype.value_or(ScalarType::Half);
++  Tensor DW = torch::stable::new_empty(W, {m, n}, dtype_);
++  cudaStream_t stream = get_current_cuda_stream(device_idx);
++
++  VLLM_DISPATCH_FLOATING_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
++    auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
++    to_cuda((void*)W.data_ptr(), (scalar_t*)DW.data_ptr(), m * n, stream);
++  });
++
++  return DW;
++}
++
++namespace {
++std::atomic<int> matvec_mode{[]() {
++  const char* value = std::getenv("VLLM_GGUF_MATVEC_MODE");
++  return value && std::strcmp(value, "3") == 0 ? 3 : value && std::strcmp(value, "2") == 0 ? 2 : value && std::strcmp(value, "1") == 0 ? 1 : 0;
++}()};
++int64_t select_matvec_rows(int64_t type, int64_t row, int64_t col) {
++  int64_t launch_rows = 1;
++  if (type == 12 && row == 5120 && col == 6144) launch_rows = 16;
++  if (type == 11 && row == 5120 && col == 17408) launch_rows = 16;
++  if (type == 11 && row == 5120 && col == 6144) launch_rows = 8;
++  if (type == 10 && row == 6144 && col == 5120) launch_rows = 4;
++  if (type == 11 && row == 17408 && col == 5120) launch_rows = 16;
++  if (type == 11 && row == 6144 && col == 5120) launch_rows = 2;
++  if (type == 13 && row == 17408 && col == 5120) launch_rows = 16;
++  if (type == 12 && row == 5120 && col == 17408) launch_rows = 2;
++  return launch_rows;
++}
++}
++
++int64_t ggml_set_matvec_mode(int64_t mode) {
++  if (mode < 0 || mode > 3) throw std::invalid_argument("Invalid matvec mode");
++  matvec_mode.store(mode, std::memory_order_relaxed);
++  return mode;
++}
++
+@@ -108,0 +156,142 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
++  const int variant = matvec_mode.load(std::memory_order_relaxed);
++  const bool optimize = (variant == 1 || variant == 2) && vecs == 1 && X.scalar_type() == ScalarType::BFloat16;
++  const int launch_rows = optimize ? select_matvec_rows(type, row, col) : 1;
++  const int64_t padded = (col + 512 - 1) / 512 * 512;
++  const int32_t device_idx = X.get_device_index();
++  const DeviceGuard device_guard(device_idx);
++  Tensor Y = variant == 3
++      ? torch::stable::new_empty(W, {vecs, row}, X.scalar_type())
++      : torch::stable::new_zeros(W, {vecs, row}, X.scalar_type());
++  cudaStream_t stream = get_current_cuda_stream(device_idx);
++  Tensor quant_X =
++      torch::stable::new_empty(W, {vecs, padded / 32 * 9}, ScalarType::Int);
++  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8", [&] {
++    quantize_row_q8_1_cuda<scalar_t>(
++        (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
++    switch (type) {
++      case 2:
++        mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 3:
++        mul_mat_vec_q4_1_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 6:
++        mul_mat_vec_q5_0_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 7:
++        mul_mat_vec_q5_1_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 8:
++        mul_mat_vec_q8_0_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 10:
++        mul_mat_vec_q2_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 11:
++        mul_mat_vec_q3_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 12:
++        mul_mat_vec_q4_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 13:
++        mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 14:
++        mul_mat_vec_q6_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 16:
++        mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 17:
++        mul_mat_vec_iq2_xs_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 18:
++        if (optimize && variant == 2) {
++        mul_mat_vec_iq3_xxs_readopt_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        } else {
++        mul_mat_vec_iq3_xxs_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        }
++        break;
++      case 19:
++        mul_mat_vec_iq1_s_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 20:
++        mul_mat_vec_iq4_nl_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 21:
++        if (optimize && variant == 2) {
++        mul_mat_vec_iq3_s_readopt_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        } else {
++        mul_mat_vec_iq3_s_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        }
++        break;
++      case 22:
++        mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++      case 23:
++        if (optimize && variant == 2) {
++        mul_mat_vec_iq4_xs_readopt_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        } else {
++        mul_mat_vec_iq4_xs_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        }
++        break;
++      case 29:
++        mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, launch_rows);
++        break;
++    }
++  });
++  return Y;
++}
++
++Tensor ggml_mul_mat_vec_a8_tuned(Tensor W,  // quant weight
++                           Tensor X,  // input
++                           int64_t type, int64_t row, int64_t rows_per_block) {
++  if (rows_per_block != 1 && rows_per_block != 2 && rows_per_block != 4 && rows_per_block != 8 && rows_per_block != 16) {
++    throw std::invalid_argument("rows_per_block must be 1, 2, 4, 8 or 16");
++  }
++  int64_t col = X.sizes()[1];
++  int64_t vecs = X.sizes()[0];
+@@ -123 +312 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -128 +317 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -133 +322 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -138 +327 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -143 +332 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -148 +337 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -153 +342 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -158 +347 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -163 +352 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -168 +357 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -173 +362 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -178 +367 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -183 +372 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -188 +377 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -193 +382 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -198 +387 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -203 +392 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -208 +397,120 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 29:
++        mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++    }
++  });
++  return Y;
++}
++
++Tensor ggml_mul_mat_vec_a8_readopt(Tensor W,  // quant weight
++                           Tensor X,  // input
++                           int64_t type, int64_t row, int64_t rows_per_block) {
++  if (rows_per_block != 1 && rows_per_block != 2 && rows_per_block != 4 && rows_per_block != 8 && rows_per_block != 16) {
++    throw std::invalid_argument("rows_per_block must be 1, 2, 4, 8 or 16");
++  }
++  int64_t col = X.sizes()[1];
++  int64_t vecs = X.sizes()[0];
++  const int64_t padded = (col + 512 - 1) / 512 * 512;
++  const int32_t device_idx = X.get_device_index();
++  const DeviceGuard device_guard(device_idx);
++  Tensor Y = torch::stable::new_zeros(W, {vecs, row}, X.scalar_type());
++  cudaStream_t stream = get_current_cuda_stream(device_idx);
++  Tensor quant_X =
++      torch::stable::new_empty(W, {vecs, padded / 32 * 9}, ScalarType::Int);
++  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8", [&] {
++    quantize_row_q8_1_cuda<scalar_t>(
++        (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
++    switch (type) {
++      case 2:
++        mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 3:
++        mul_mat_vec_q4_1_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 6:
++        mul_mat_vec_q5_0_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 7:
++        mul_mat_vec_q5_1_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 8:
++        mul_mat_vec_q8_0_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 10:
++        mul_mat_vec_q2_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 11:
++        mul_mat_vec_q3_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 12:
++        mul_mat_vec_q4_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 13:
++        mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 14:
++        mul_mat_vec_q6_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 16:
++        mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 17:
++        mul_mat_vec_iq2_xs_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 18:
++        mul_mat_vec_iq3_xxs_readopt_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 19:
++        mul_mat_vec_iq1_s_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 20:
++        mul_mat_vec_iq4_nl_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 21:
++        mul_mat_vec_iq3_s_readopt_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 22:
++        mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
++        break;
++      case 23:
++        mul_mat_vec_iq4_xs_readopt_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -213 +521 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
+-            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
++            (scalar_t*)Y.data_ptr(), col, row, vecs, stream, rows_per_block);
+@@ -566,0 +875,21 @@ int64_t ggml_moe_get_block_size(int64_t type) {
++
++Tensor ggml_mul_mat_vec_a8_auto(Tensor W, Tensor X, int64_t type, int64_t row, int64_t variant) {
++  if (X.scalar_type() != ScalarType::BFloat16 || X.sizes()[0] != 1) {
++    return ggml_mul_mat_vec_a8(W, X, type, row);
++  }
++  int64_t col = X.sizes()[1];
++  int64_t launch_rows = 1;
++  if (type == 12 && row == 5120 && col == 6144) launch_rows = 16;
++  if (type == 11 && row == 5120 && col == 17408) launch_rows = 16;
++  if (type == 11 && row == 5120 && col == 6144) launch_rows = 8;
++  if (type == 10 && row == 6144 && col == 5120) launch_rows = 4;
++  if (type == 11 && row == 17408 && col == 5120) launch_rows = 16;
++  if (type == 11 && row == 6144 && col == 5120) launch_rows = 2;
++  if (type == 13 && row == 17408 && col == 5120) launch_rows = 16;
++  if (type == 12 && row == 5120 && col == 17408) launch_rows = 2;
++  if (variant == 2 && (type == 18 || type == 21 || type == 23)) {
++    return ggml_mul_mat_vec_a8_readopt(W, X, type, row, launch_rows);
++  }
++  if (launch_rows != 1) return ggml_mul_mat_vec_a8_tuned(W, X, type, row, launch_rows);
++  return ggml_mul_mat_vec_a8(W, X, type, row);
++}
+diff --git a/vllm_gguf_plugin/csrc/gguf/mmvq.cuh b/vllm_gguf_plugin/csrc/gguf/mmvq.cuh
+index e27bec7..fe1d932 100644
+--- a/vllm_gguf_plugin/csrc/gguf/mmvq.cuh
++++ b/vllm_gguf_plugin/csrc/gguf/mmvq.cuh
+@@ -44,2 +44,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_q4_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_q4_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -47 +47 @@ static void mul_mat_vec_q4_0_q8_1_cuda(const void * vx, const void * vy, scalar_
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -53,2 +53,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_q4_1_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_q4_1_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -56 +56 @@ static void mul_mat_vec_q4_1_q8_1_cuda(const void * vx, const void * vy, scalar_
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -62,2 +62,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_q5_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_q5_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -65 +65 @@ static void mul_mat_vec_q5_0_q8_1_cuda(const void * vx, const void * vy, scalar_
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -71,2 +71,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_q5_1_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_q5_1_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -74 +74 @@ static void mul_mat_vec_q5_1_q8_1_cuda(const void * vx, const void * vy, scalar_
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -80,2 +80,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_q8_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_q8_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -83 +83 @@ static void mul_mat_vec_q8_0_q8_1_cuda(const void * vx, const void * vy, scalar_
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -89,2 +89,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_q2_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_q2_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -92 +92 @@ static void mul_mat_vec_q2_K_q8_1_cuda(const void * vx, const void * vy, scalar_
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -98,2 +98,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_q3_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_q3_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -101 +101 @@ static void mul_mat_vec_q3_K_q8_1_cuda(const void * vx, const void * vy, scalar_
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -107,2 +107,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -110 +110 @@ static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, scalar_
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -116,2 +116,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -119 +119 @@ static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, scalar_
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -125,2 +125,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -128 +128 @@ static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, scalar_
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -134,2 +134,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_iq2_xxs_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_iq2_xxs_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -137 +137 @@ static void mul_mat_vec_iq2_xxs_q8_1_cuda(const void * vx, const void * vy, scal
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -143,2 +143,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_iq2_xs_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_iq2_xs_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -146 +146 @@ static void mul_mat_vec_iq2_xs_q8_1_cuda(const void * vx, const void * vy, scala
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -152,2 +152,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_iq2_s_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_iq2_s_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -155 +155 @@ static void mul_mat_vec_iq2_s_q8_1_cuda(const void * vx, const void * vy, scalar
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -161,2 +161,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_iq3_xxs_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_iq3_xxs_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -164 +164 @@ static void mul_mat_vec_iq3_xxs_q8_1_cuda(const void * vx, const void * vy, scal
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -170,2 +170,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_iq1_s_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_iq1_s_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -173 +173 @@ static void mul_mat_vec_iq1_s_q8_1_cuda(const void * vx, const void * vy, scalar
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -179,2 +179,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_iq1_m_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_iq1_m_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -182 +182 @@ static void mul_mat_vec_iq1_m_q8_1_cuda(const void * vx, const void * vy, scalar
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -188,2 +188,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_iq4_nl_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_iq4_nl_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -191 +191 @@ static void mul_mat_vec_iq4_nl_q8_1_cuda(const void * vx, const void * vy, scala
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -197,2 +197,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_iq4_xs_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_iq4_xs_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -200 +200 @@ static void mul_mat_vec_iq4_xs_q8_1_cuda(const void * vx, const void * vy, scala
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -206,2 +206,2 @@ template<typename scalar_t>
+-static void mul_mat_vec_iq3_s_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
++static void mul_mat_vec_iq3_s_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
+@@ -209 +209 @@ static void mul_mat_vec_iq3_s_q8_1_cuda(const void * vx, const void * vy, scalar
+-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+@@ -212,0 +213,27 @@ static void mul_mat_vec_iq3_s_q8_1_cuda(const void * vx, const void * vy, scalar
++
++template<typename scalar_t>
++static void mul_mat_vec_iq3_s_readopt_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
++    const dim3 block_nums(block_num_y, nvecs, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
++    mul_mat_vec_q<scalar_t, QK_K, QI3_XS, block_iq3_s, 1, vec_dot_iq3_s_readopt_q8_1>
++        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
++}
++
++template<typename scalar_t>
++static void mul_mat_vec_iq3_xxs_readopt_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
++    const dim3 block_nums(block_num_y, nvecs, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
++    mul_mat_vec_q<scalar_t, QK_K, QI3_XXS, block_iq3_xxs, 1, vec_dot_iq3_xxs_readopt_q8_1>
++        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
++}
++
++template<typename scalar_t>
++static void mul_mat_vec_iq4_xs_readopt_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream, int rows_per_block = GGML_CUDA_MMV_Y) {
++    const int block_num_y = (nrows + rows_per_block - 1) / rows_per_block;
++    const dim3 block_nums(block_num_y, nvecs, 1);
++    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
++    mul_mat_vec_q<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_readopt_q8_1>
++        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
++}
+diff --git a/vllm_gguf_plugin/csrc/gguf/vecdotq.cuh b/vllm_gguf_plugin/csrc/gguf/vecdotq.cuh
+index d0d4c74..ee66663 100644
+--- a/vllm_gguf_plugin/csrc/gguf/vecdotq.cuh
++++ b/vllm_gguf_plugin/csrc/gguf/vecdotq.cuh
+@@ -1812 +1812,84 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
+-}
+\ No newline at end of file
++}
++static __device__ __forceinline__ float vec_dot_iq3_s_readopt_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
++    const block_iq3_s * bq2 = (const block_iq3_s *) vbq;
++
++    const int ib32 = iqs;
++    const uint8_t  * qs = bq2->qs + 8*ib32;
++    const int8_t   * q8 = bq8_1[ib32].qs;
++    const uint16_t * pairs = (const uint16_t *)qs;
++    const uint8_t qh = bq2->qh[ib32];
++    const uint32_t sign_bits = (uint32_t)get_int_b2(bq2->signs, ib32);
++    int sumi = 0;
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++        const uint32_t * grid1 = iq3xs_grid + ((pairs[l] & 255) | ((qh << (8 - 2*l)) & 256));
++        const uint32_t * grid2 = iq3xs_grid + ((pairs[l] >> 8) | ((qh << (7 - 2*l)) & 256));
++        uint32_t signs0 = __vcmpeq4(((((sign_bits >> (8*l)) & 255) & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
++        uint32_t signs1 = __vcmpeq4(((((sign_bits >> (8*l)) & 255) >>  4) * 0x01010101) & 0x08040201, 0x08040201);
++        const int grid_l = __vsub4(grid1[0] ^ signs0, signs0);
++        const int grid_h = __vsub4(grid2[0] ^ signs1, signs1);
++        sumi = __dp4a(grid_l, *((int *)q8+0), sumi);
++        sumi = __dp4a(grid_h, *((int *)q8+1), sumi);
++        q8 += 8;
++    }
++    const float d = __half2float(bq2->d) * (0.5f + ((bq2->scales[ib32/2] >> 4*(ib32%2)) & 0xf)) * __low2float(bq8_1[ib32].ds) * 0.5f;
++    return d * sumi;
++#endif
++}
++
++static __device__ __forceinline__ float vec_dot_iq3_xxs_readopt_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
++    const block_iq3_xxs * bq2 = (const block_iq3_xxs *) vbq;
++
++    const int ib32 = iqs;
++    const uint8_t  * q3 = bq2->qs + 8*ib32;
++    const uint16_t * gas = (const uint16_t *)(bq2->qs + QK_K/4) + 2*ib32;
++    const int8_t   * q8 = bq8_1[ib32].qs;
++    uint32_t aux32 = gas[0] | (gas[1] << 16);
++    const uint16_t * pairs = (const uint16_t *)q3;
++    int sumi = 0;
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++        const uint32_t * grid1 = iq3xxs_grid + (pairs[l] & 255);
++        const uint32_t * grid2 = iq3xxs_grid + (pairs[l] >> 8);
++        const uint32_t * signs = (const uint32_t *)(ksigns64 + (aux32 & 127));
++        const int grid_l = __vsub4(grid1[0] ^ signs[0], signs[0]);
++        const int grid_h = __vsub4(grid2[0] ^ signs[1], signs[1]);
++        sumi = __dp4a(grid_l, *((int *)q8+0), sumi);
++        sumi = __dp4a(grid_h, *((int *)q8+1), sumi);
++        q8 += 8;
++        aux32 >>= 7;
++    }
++    const float d = __half2float(bq2->d) * (0.5f + aux32) * __low2float(bq8_1[ib32].ds) * 0.5f;
++    return d * sumi;
++#endif
++}
++
++static __device__ __forceinline__ float vec_dot_iq4_xs_readopt_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
++    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq;
++    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
++
++    // iqs is 0...7
++    const int ib32 = iqs;
++    const int32_t  * q8 = (const int *)bq8_1[ib32].qs;
++    const uint32_t * q4 = (const uint32_t *)bq4->qs + 4*ib32;
++    const int8_t ls = ((bq4->scales_l[ib32/2] >> 4*(ib32%2)) & 0xf) | (((bq4->scales_h >> 2*ib32) & 3) << 4);
++    const float d = __half2float(bq4->d) * (ls - 32) * __low2float(bq8_1[ib32].ds);
++    const uint2 q01 = ((const uint2 *)q4)[0];
++    const uint2 q23 = ((const uint2 *)q4)[1];
++    int v1, v2;
++    int sumi1 = 0, sumi2 = 0;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        get_int_from_table_16(j == 0 ? q01.x : j == 1 ? q01.y : j == 2 ? q23.x : q23.y, values, v1, v2);
++        sumi1 = __dp4a(v1, q8[j+0], sumi1);
++        sumi2 = __dp4a(v2, q8[j+4], sumi2);
++    }
++    return d * (sumi1 + sumi2);
++#endif
++}
+diff --git a/vllm_gguf_plugin/csrc/torch_bindings.cpp b/vllm_gguf_plugin/csrc/torch_bindings.cpp
+index ebc4ee6..1bc56e3 100644
+--- a/vllm_gguf_plugin/csrc/torch_bindings.cpp
++++ b/vllm_gguf_plugin/csrc/torch_bindings.cpp
+@@ -9,0 +10,3 @@ using torch::stable::Tensor;
++int64_t ggml_set_matvec_mode(int64_t mode);
++Tensor ggml_mul_mat_vec_a8_readopt(Tensor W, Tensor X, int64_t type, int64_t row, int64_t rows_per_block);
++Tensor ggml_mul_mat_vec_a8_auto(Tensor W, Tensor X, int64_t type, int64_t row, int64_t variant);
+@@ -12,0 +16,2 @@ Tensor ggml_dequantize(Tensor W, int64_t type, int64_t m, int64_t n,
++Tensor ggml_dequantize_empty(Tensor W, int64_t type, int64_t m, int64_t n,
++                              std::optional<ScalarType> dtype);
+@@ -13,0 +19 @@ Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row);
++Tensor ggml_mul_mat_vec_a8_tuned(Tensor W, Tensor X, int64_t type, int64_t row, int64_t rows_per_block);
+@@ -22,0 +29,5 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
++  ops.def("ggml_set_matvec_mode(int mode) -> int");
++  ops.def("ggml_mul_mat_vec_a8_readopt(Tensor W, Tensor X, int type, SymInt row, int rows_per_block) -> Tensor");
++  ops.def("ggml_mul_mat_vec_a8_auto(Tensor W, Tensor X, int type, SymInt row, int variant) -> Tensor");
++  ops.def("ggml_mul_mat_vec_a8_tuned(Tensor W, Tensor X, int type, SymInt row, int rows_per_block) -> Tensor");
++  ops.def("ggml_dequantize_empty(Tensor W, int type, SymInt m, SymInt n, ScalarType? dtype) -> Tensor");
+@@ -43,0 +55,4 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
++  ops.impl("ggml_mul_mat_vec_a8_readopt", TORCH_BOX(&ggml_mul_mat_vec_a8_readopt));
++  ops.impl("ggml_mul_mat_vec_a8_auto", TORCH_BOX(&ggml_mul_mat_vec_a8_auto));
++  ops.impl("ggml_mul_mat_vec_a8_tuned", TORCH_BOX(&ggml_mul_mat_vec_a8_tuned));
++  ops.impl("ggml_dequantize_empty", TORCH_BOX(&ggml_dequantize_empty));
+@@ -51,0 +67 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CompositeExplicitAutograd, ops) {
++  ops.impl("ggml_set_matvec_mode", TORCH_BOX(&ggml_set_matvec_mode));
+diff --git a/vllm_gguf_plugin/ops.py b/vllm_gguf_plugin/ops.py
+index cc3a0d3..220bb03 100644
+--- a/vllm_gguf_plugin/ops.py
++++ b/vllm_gguf_plugin/ops.py
+@@ -2,0 +3 @@
++import json
+@@ -4,0 +6 @@ import os
++import gguf
+@@ -107,0 +110,20 @@ def _cuda_gemm_kernel_available(op_name: str, quant_type: int) -> bool:
++_MATVEC_TUNING = {}
++_MATVEC_MODE = int(os.getenv("VLLM_GGUF_MATVEC_MODE", "0"))
++
++
++def set_matvec_tuning(rows):
++    global _MATVEC_TUNING
++    mapping = {}
++    for row in rows:
++        value = int(row["rows_per_block"])
++        if value not in (1, 2, 4, 8, 16):
++            raise ValueError("Invalid matvec launch configuration")
++        mapping[(int(row["type"]), int(row["row"]), int(row["col"]))] = value
++    _MATVEC_TUNING = mapping
++
++
++if path := os.getenv("VLLM_GGUF_MATVEC_TUNING"):
++    with open(path) as config_file:
++        set_matvec_tuning(json.load(config_file)["rows"])
++
++
+@@ -125,0 +148,3 @@ if (
++    if hasattr(torch.ops._C_gguf, "ggml_dequantize_empty"):
++        register_fake("_C_gguf::ggml_dequantize_empty")(_ggml_dequantize_fake)
++
+@@ -134,0 +160,6 @@ if (
++    if hasattr(torch.ops._C_gguf, "ggml_mul_mat_vec_a8_tuned"):
++
++        @register_fake("_C_gguf::ggml_mul_mat_vec_a8_tuned")
++        def _ggml_mul_mat_vec_tuned_fake(W, X, quant_type, row, rows_per_block):
++            return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
++
+@@ -184,0 +216,6 @@ def ggml_dequantize(
++        if (
++            os.getenv("VLLM_GGUF_DEQUANT_NOZERO", "0") == "1"
++            and hasattr(torch.ops._C_gguf, "ggml_dequantize_empty")
++            and m * n % gguf.GGML_QUANT_SIZES[quant_type][0] == 0
++        ):
++            return torch.ops._C_gguf.ggml_dequantize_empty(W, quant_type, m, n, dtype)
+@@ -195,0 +233,6 @@ def ggml_mul_mat_vec_a8(
++        if _MATVEC_TUNING and X.shape[0] == 1 and X.dtype == torch.bfloat16:
++            launch_rows = _MATVEC_TUNING.get((int(quant_type), int(row), X.shape[1]), 1)
++            if launch_rows != 1:
++                return torch.ops._C_gguf.ggml_mul_mat_vec_a8_tuned(
++                    W, X, quant_type, row, launch_rows
++                )
+diff --git a/vllm_gguf_plugin/quantization/linear.py b/vllm_gguf_plugin/quantization/linear.py
+index c18c1a7..b26427c 100644
+--- a/vllm_gguf_plugin/quantization/linear.py
++++ b/vllm_gguf_plugin/quantization/linear.py
+@@ -3,0 +4,2 @@
++import os
++
+@@ -162,0 +165,23 @@ class GGUFLinearMethod(LinearMethodBase):
++        if os.getenv("VLLM_GGUF_PREPACK_MIXED", "0") == "1":
++            self._prepack_mixed_shards(layer)
++
++    def _prepack_mixed_shards(self, layer: torch.nn.Module) -> None:
++        weight = layer.weight
++        ids = getattr(weight, "shard_id", [])
++        fallback = layer.weight_type.weight_type
++        kinds = layer.weight_type.shard_weight_type
++        if not ids or len({kinds.get(idx, fallback) for idx in ids}) <= 1:
++            return
++        names = {}
++        layer._gguf_original_padded_shape = tuple(weight.shape)
++        for index, idx in enumerate(ids):
++            start, end, width = weight.shard_offset_map[idx]
++            name = f"_gguf_packed_shard_{index}"
++            # Clone every shard: even contiguous slices must stop owning padding.
++            packed = weight[start:end, :width].clone(
++                memory_format=torch.contiguous_format
++            )
++            layer.register_buffer(name, packed, persistent=False)
++            names[idx] = name
++        layer._gguf_prepacked_names = names
++        weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
+@@ -255,4 +280,5 @@ class GGUFLinearMethod(LinearMethodBase):
+-                result.append(
+-                    fused_mul_mat_gguf_op(
+-                        x, weight[start:end, :offset].contiguous(), weight_type
+-                    )
++                packed_names = getattr(layer, "_gguf_prepacked_names", {})
++                shard = (
++                    getattr(layer, packed_names[idx])
++                    if packed_names
++                    else weight[start:end, :offset].contiguous()
+@@ -259,0 +286 @@ class GGUFLinearMethod(LinearMethodBase):
++                result.append(fused_mul_mat_gguf_op(x, shard, weight_type))
+diff --git a/vllm_gguf_plugin/weights_adapter/qwen3_5.py b/vllm_gguf_plugin/weights_adapter/qwen3_5.py
+index 30797ae..bd57165 100644
+--- a/vllm_gguf_plugin/weights_adapter/qwen3_5.py
++++ b/vllm_gguf_plugin/weights_adapter/qwen3_5.py
+@@ -11,0 +12 @@ import torch
++from transformers import Qwen3_5Config, Qwen3_5MoeConfig
+@@ -14,2 +14,0 @@ from vllm.model_executor.models.utils import WeightsMapper
+-from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
+-from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
+@@ -225 +224,5 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
+-        patched.architectures = [architecture]
++        # Only force the multimodal wrapper when a projector is present; a
++        # text-only config keeps the CausalLM architecture (and any
++        # hf_overrides) chosen by the user.
++        if files.mm_proj is not None:
++            patched.architectures = [architecture]

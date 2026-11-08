@@ -1,0 +1,180 @@
+{
+  "decode_kernel_ms": 488.81116699997096,
+  "kernel_count": 59365,
+  "ops_ms": {
+    "aten::fill_": 10.308106999999763,
+    "aten::arange": 0.02287900000000001,
+    "unknown": 10.709577000000044,
+    "aten::add": 0.041599,
+    "aten::copy_": 2.5142410000000064,
+    "aten::index_select": 0.050241999999999995,
+    "_C_gguf::ggml_dequantize_empty": 0.030942999999999995,
+    "_C_gguf::ggml_mul_mat_vec_a8": 438.10740499998104,
+    "vllm::qwen_gdn_attention_core": 12.329904999999915,
+    "aten::cat": 2.2378760000000137,
+    "_C::silu_and_mul": 6.0425820000001345,
+    "_C_cache_ops::reshape_and_cache_flash": 1.4617930000000003,
+    "vllm::unified_attention_with_output": 4.954017999999989
+  },
+  "top_ops": [
+    [
+      "_C_gguf::ggml_mul_mat_vec_a8",
+      438.10740499998104
+    ],
+    [
+      "vllm::qwen_gdn_attention_core",
+      12.329904999999915
+    ],
+    [
+      "unknown",
+      10.709577000000044
+    ],
+    [
+      "aten::fill_",
+      10.308106999999763
+    ],
+    [
+      "_C::silu_and_mul",
+      6.0425820000001345
+    ],
+    [
+      "vllm::unified_attention_with_output",
+      4.954017999999989
+    ],
+    [
+      "aten::copy_",
+      2.5142410000000064
+    ],
+    [
+      "aten::cat",
+      2.2378760000000137
+    ],
+    [
+      "_C_cache_ops::reshape_and_cache_flash",
+      1.4617930000000003
+    ],
+    [
+      "aten::index_select",
+      0.050241999999999995
+    ]
+  ],
+  "launch_examples": {
+    "void mul_mat_vec_q<c10::BFloat16, 256, 8, block_iq4_xs, 1, &_INTERNAL_a6bead66_14_gguf_kernel_cu_a360aac4::vec_dot_iq4_xs_q8_1>(void const*, void const*, c10::BFloat16*, int, int, int)": {
+      "External id": 46738,
+      "queued": 0,
+      "device": 0,
+      "context": 1,
+      "stream": 7,
+      "correlation": 36019,
+      "registers per thread": 44,
+      "shared memory": 0,
+      "blocks per SM": 195.04762268066406,
+      "warps per SM": 195.04762268066406,
+      "grid": [
+        16384,
+        1,
+        1
+      ],
+      "block": [
+        32,
+        1,
+        1
+      ],
+      "est. achieved occupancy %": 50,
+      "occupancy": {
+        "activeBlocksPerMultiprocessor": 24,
+        "limitingFactors": "BLOCKS",
+        "blockLimitRegs": 40,
+        "blockLimitSharedMem": 100,
+        "blockLimitWarps": 48,
+        "blockLimitBlocks": 24,
+        "blockLimitBarriers": 2147483647,
+        "allocatedRegistersPerBlock": 1536,
+        "allocatedSharedMemPerBlock": 1024
+      },
+      "graph id": 0,
+      "graph node id": 0,
+      "priority": 0,
+      "channel": 0,
+      "channel_type": 1
+    },
+    "void mul_mat_vec_q<c10::BFloat16, 32, 8, block_q8_0, 2, &_INTERNAL_a6bead66_14_gguf_kernel_cu_a360aac4::vec_dot_q8_0_q8_1>(void const*, void const*, c10::BFloat16*, int, int, int)": {
+      "External id": 46750,
+      "queued": 0,
+      "device": 0,
+      "context": 1,
+      "stream": 7,
+      "correlation": 36050,
+      "registers per thread": 40,
+      "shared memory": 0,
+      "blocks per SM": 1.1428571939468384,
+      "warps per SM": 1.1428571939468384,
+      "grid": [
+        96,
+        1,
+        1
+      ],
+      "block": [
+        32,
+        1,
+        1
+      ],
+      "est. achieved occupancy %": 2,
+      "occupancy": {
+        "activeBlocksPerMultiprocessor": 24,
+        "limitingFactors": "BLOCKS",
+        "blockLimitRegs": 48,
+        "blockLimitSharedMem": 100,
+        "blockLimitWarps": 48,
+        "blockLimitBlocks": 24,
+        "blockLimitBarriers": 2147483647,
+        "allocatedRegistersPerBlock": 1280,
+        "allocatedSharedMemPerBlock": 1024
+      },
+      "graph id": 0,
+      "graph node id": 0,
+      "priority": 0,
+      "channel": 0,
+      "channel_type": 1
+    },
+    "void mul_mat_vec_q<c10::BFloat16, 256, 32, block_q4_K, 2, &_INTERNAL_a6bead66_14_gguf_kernel_cu_a360aac4::vec_dot_q4_K_q8_1>(void const*, void const*, c10::BFloat16*, int, int, int)": {
+      "External id": 46811,
+      "queued": 0,
+      "device": 0,
+      "context": 1,
+      "stream": 7,
+      "correlation": 36149,
+      "registers per thread": 40,
+      "shared memory": 0,
+      "blocks per SM": 60.9523811340332,
+      "warps per SM": 60.9523811340332,
+      "grid": [
+        5120,
+        1,
+        1
+      ],
+      "block": [
+        32,
+        1,
+        1
+      ],
+      "est. achieved occupancy %": 50,
+      "occupancy": {
+        "activeBlocksPerMultiprocessor": 24,
+        "limitingFactors": "BLOCKS",
+        "blockLimitRegs": 48,
+        "blockLimitSharedMem": 100,
+        "blockLimitWarps": 48,
+        "blockLimitBlocks": 24,
+        "blockLimitBarriers": 2147483647,
+        "allocatedRegistersPerBlock": 1280,
+        "allocatedSharedMemPerBlock": 1024
+      },
+      "graph id": 0,
+      "graph node id": 0,
+      "priority": 0,
+      "channel": 0,
+      "channel_type": 1
+    }
+  }
+}
